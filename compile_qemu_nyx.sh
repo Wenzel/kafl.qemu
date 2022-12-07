@@ -71,10 +71,10 @@ configure_qemu()
       $QEMU_CONFIGURE --enable-nyx --enable-sanitizers --enable-debug --enable-nyx-debug
       ;;
     "debug_static")
-      $QEMU_CONFIGURE --enable-nyx --enable-sanitizers --enable-debug --enable-nyx-debug --enable-nyx-static
+      $QEMU_CONFIGURE --enable-nyx --enable-sanitizers --enable-debug --enable-nyx-debug --enable-nyx-static --static
       ;;
     "static")
-      $QEMU_CONFIGURE --enable-nyx --enable-nyx-static
+      $QEMU_CONFIGURE --enable-nyx --enable-nyx-static --static
       ;;
     "lto")
       $QEMU_CONFIGURE --enable-nyx --enable-nyx-static --enable-nyx-flto
