@@ -27,6 +27,7 @@ along with QEMU-PT.  If not, see <http://www.gnu.org/licenses/>.
 #include <linux/kvm.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <inttypes.h>
 
 #include "sysemu/cpus.h"
 #include "sysemu/hw_accel.h"
@@ -567,6 +568,7 @@ static void handle_hypercall_kafl_lock(struct kvm_run *run,
                                        CPUState       *cpu,
                                        uint64_t        hypercall_arg)
 {
+    nyx_debug_p(CORE_PREFIX, "enter %s\n", __func__);
     if (is_called_in_fuzzing_mode("KVM_EXIT_KAFL_LOCK")) {
         return;
     }
@@ -832,7 +834,7 @@ int handle_kafl_hypercall(struct kvm_run *run,
                           uint64_t        arg)
 {
     int ret = -1;
-    // nyx_debug("%s -> %ld\n", __func__, hypercall);
+    nyx_debug_p(CORE_PREFIX, "%s -> %" PRIx64 "\n", __func__, hypercall);
 
     // FIXME: ret is always 0. no default case.
     switch (hypercall) {
