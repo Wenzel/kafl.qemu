@@ -34,5 +34,7 @@ hypercall/debug.o \
 state/state.o \
 state/snapshot_state.o \
 pt.o \
+pt_vmx.o \
+pt_perf.o \
 mem_split.o
 

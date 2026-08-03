@@ -55,6 +55,7 @@ along with QEMU-PT.  If not, see <http://www.gnu.org/licenses/>.
 #include "nyx/synchronization.h"
 #include "nyx/trace_dump.h"
 #include "nyx/pt.h"
+#include "nyx/pt_backend.h"
 #include "nyx/redqueen.h"
 #include "nyx/auxiliary_buffer.h"
 
@@ -95,6 +96,9 @@ typedef struct nyx_interface_state {
     bool redqueen;
 
     uint32_t aux_buffer_size;
+
+    /* "vmx" (default) or "perf"; see nyx/pt_backend.h */
+    char *pt_backend;
 } nyx_interface_state;
 
 static void nyx_interface_event(void *opaque, int event)
@@ -432,6 +436,37 @@ static void nyx_realize(DeviceState *dev, Error **errp)
                                  NULL, true);
     }
 
+    /*
+    Backend selection. Left alone unless the user asked for something, so a
+    command line that predates this option behaves exactly as before, and so a
+    host without the Nyx KVM module still gets PT_BACKEND_NONE from the
+    capability probe in kvm_init() rather than having it overwritten here.
+    */
+    if (s->pt_backend) {
+        pt_backend_kind_t kind;
+
+        if (!pt_backend_kind_from_string(s->pt_backend, &kind)) {
+            nyx_abort("Invalid pt_backend \"%s\" (expected vmx, perf or none)\n",
+                      s->pt_backend);
+        }
+
+        if (kind == PT_BACKEND_PERF && pt_backend_kind == PT_BACKEND_NONE) {
+            /*
+            The capability probe already decided there is no PT here, which on
+            a stock kernel also means hypercalls have moved to the VMware I/O
+            backdoor. Combining that with a live PT session is a state the rest
+            of the code still asserts against, so refuse it explicitly instead
+            of half enabling it.
+            */
+            nyx_abort("pt_backend=perf requires the Nyx KVM module for the "
+                      "hypercall path in this build. Running the perf backend "
+                      "on a stock kernel is not wired up yet.\n");
+        }
+
+        pt_backend_select(kind);
+        nyx_debug("PT backend: %s\n", pt_backend_kind_to_string(kind));
+    }
+
     check_available_ipt_ranges(s);
 
     pt_setup_enable_hypercalls();
@@ -473,6 +508,7 @@ static Property nyx_interface_properties[] = {
                        nyx_interface_state,
                        aux_buffer_size,
                        DEFAULT_AUX_BUFFER_SIZE),
+    DEFINE_PROP_STRING("pt_backend", nyx_interface_state, pt_backend),
 
 
     DEFINE_PROP_END_OF_LIST(),

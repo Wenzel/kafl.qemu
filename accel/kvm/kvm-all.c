@@ -54,6 +54,7 @@
 #include "nyx/hypercall/hypercall.h"
 #include "nyx/interface.h"
 #include "nyx/pt.h"
+#include "nyx/pt_backend.h"
 #include "nyx/snapshot/memory/backend/nyx_dirty_ring.h"
 #include "nyx/state/state.h"
 #include "nyx/synchronization.h"
@@ -1979,11 +1980,22 @@ static int kvm_init(MachineState *ms)
         s->nyx_no_pt_mode           = true;
         GET_GLOBAL_STATE()->nyx_pt = false;
         GET_GLOBAL_STATE()->pt_trace_mode = false; // Intel PT is not available in this mode
-    } 
+        /*
+        No Nyx KVM module, so there is no vmx_pt trace source. The nyx device
+        may still select the perf backend later; until it does, PT is off.
+
+        Note this is deliberately NOT the same condition as nyx_no_pt_mode,
+        which also selects dirty ring snapshots and the VMware backdoor
+        hypercall path. Overloading that flag to mean "which PT backend" would
+        change the snapshot mechanism underneath any A/B comparison.
+        */
+        pt_backend_select(PT_BACKEND_NONE);
+    }
     else {
         s->nyx_no_pt_mode           = false;
         GET_GLOBAL_STATE()->nyx_pt = true;
         GET_GLOBAL_STATE()->pt_trace_mode = true;
+        pt_backend_select(PT_BACKEND_VMX);
     }
 
     if (ioctl(s->fd, KVM_CHECK_EXTENSION, KVM_CAP_NYX_FDL) == 1){
@@ -2487,7 +2499,7 @@ int kvm_cpu_exec(CPUState *cpu)
 
 #ifdef QEMU_NYX
         // clang-format on
-        if (!kvm_state->nyx_no_pt_mode) {
+        if (pt_backend_kind != PT_BACKEND_NONE) {
             pt_pre_kvm_run(cpu);
         }
 // clang-format off
@@ -2518,7 +2530,7 @@ int kvm_cpu_exec(CPUState *cpu)
 
 #ifdef QEMU_NYX
         // clang-format on
-        if (!kvm_state->nyx_no_pt_mode) {
+        if (pt_backend_kind != PT_BACKEND_NONE) {
             pt_post_kvm_run(cpu);
         }
 // clang-format off
