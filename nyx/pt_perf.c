@@ -71,6 +71,7 @@ region can wrap and must be joined in order.
 #define PT_PMU_TYPE_PATH "/sys/bus/event_source/devices/intel_pt/type"
 #define PT_CAPS_DIR      "/sys/bus/event_source/devices/intel_pt/caps/"
 #define PT_PARANOID_PATH "/proc/sys/kernel/perf_event_paranoid"
+#define PT_MODE_PATH     "/sys/module/kvm_intel/parameters/pt_mode"
 
 /*
 Match vmx_pt's ToPA capacity so that overflow behaviour is comparable
@@ -126,6 +127,7 @@ static bool     perf_pt_preflight_done;
 static uint32_t perf_pt_pmu_type;
 static unsigned perf_pt_num_address_ranges;
 static bool     perf_pt_has_cr3_filtering;
+static bool     perf_pt_cr3_write_path;
 
 static long perf_event_open_syscall(struct perf_event_attr *attr,
                                     pid_t                   pid,
@@ -213,6 +215,99 @@ static bool perf_pt_check_vmx_misc(void)
 }
 
 /*
+Require kvm_intel's pt_mode to be 0 (PT_MODE_SYSTEM).
+
+In system mode the guest's RTIT_CTL is left alone and one host wide PT
+session sees both root and non-root execution, which is exactly what this
+backend decodes. In host-guest mode (pt_mode=1) the CPU maintains separate
+ToPA buffers per side and the guest's output would never reach our AUX ring.
+
+Absence of the sysfs file is a pass, not a failure, and that is the normal
+case rather than an edge case: upstream commit aa0d42cacf09 wrapped the
+module_param in #ifdef CONFIG_BROKEN in response to CVE-2024-53135, so on
+any current kernel pt_mode is hardwired to PT_MODE_SYSTEM and deliberately
+not exposed. A readable file therefore means an older or patched kernel
+where the value can actually be something else, so that is the only case
+worth reading.
+*/
+static bool perf_pt_check_pt_mode(void)
+{
+	uint64_t v;
+
+	if (!read_u64_file(PT_MODE_PATH, &v)) {
+		nyx_debug("perf PT: %s absent, so pt_mode is hardwired to "
+		          "PT_MODE_SYSTEM\n", PT_MODE_PATH);
+		return true;
+	}
+
+	if (v != 0) {
+		nyx_error("perf PT: kvm_intel pt_mode is %lu, not 0 (PT_MODE_SYSTEM). "
+		          "In host-guest mode the guest writes its own ToPA buffer and "
+		          "its trace never reaches this event, so coverage would be "
+		          "silently empty. Reload kvm_intel with pt_mode=0.\n", v);
+		return false;
+	}
+
+	nyx_debug("perf PT: kvm_intel pt_mode=0 (PT_MODE_SYSTEM)\n");
+	return true;
+}
+
+/*
+Probe whether this kernel honours attr.config2 as IA32_RTIT_CR3_MATCH.
+
+The write path is out of tree, so detect it rather than assume it. Vanilla
+pt_event_valid() has no config2 branch at all and PMUs reject unknown
+config2 bits, so an unpatched kernel fails this open with EINVAL while a
+patched one accepts it.
+
+Done once at startup on a throwaway event, because the alternative is
+discovering it at the first pt_set_cr3() call, which happens well into a
+campaign and after the fuzzer has already reported itself as running. There
+is no software fallback for CR3, so late detection means a wasted run.
+
+A non-EINVAL failure is reported as "unknown" rather than "absent": if the
+open failed for an unrelated reason the probe simply did not answer, and
+claiming the patch is missing would send the reader after the wrong problem.
+*/
+static bool perf_pt_probe_cr3_write_path(void)
+{
+	struct perf_event_attr attr;
+	long                   fd;
+
+	if (!perf_pt_has_cr3_filtering) {
+		return false;
+	}
+
+	memset(&attr, 0, sizeof(attr));
+	attr.size     = sizeof(attr);
+	attr.type     = perf_pt_pmu_type;
+	attr.config   = PT_CFG_PT | PT_CFG_BRANCH | PT_CFG_NORETCOMP;
+	attr.disabled = 1;
+
+	/*
+	A syntactically valid but harmless match value: bits 4:0 of the MSR are
+	reserved and must be zero, so 0x1000 exercises the accept path without
+	depending on any real guest CR3.
+	*/
+	attr.config2 = 0x1000;
+
+	fd = perf_event_open_syscall(&attr, 0, -1, -1, 0);
+	if (fd >= 0) {
+		close((int)fd);
+		return true;
+	}
+
+	if (errno == EINVAL) {
+		nyx_debug("perf PT: attr.config2 rejected with EINVAL, so this kernel "
+		          "lacks the IA32_RTIT_CR3_MATCH write path\n");
+	} else {
+		nyx_warn("perf PT: the CR3 write path probe could not be answered "
+		         "(%s). Treating it as unavailable.\n", strerror(errno));
+	}
+	return false;
+}
+
+/*
 Startup gate. Everything checked here produces silently degraded coverage
 rather than a visible error if it is wrong, which is why each one is checked
 up front and reported once instead of being discovered from a bad campaign.
@@ -241,6 +336,10 @@ static bool perf_pt_preflight(void)
 		return false;
 	}
 
+	if (!perf_pt_check_pt_mode()) {
+		return false;
+	}
+
 	if (!perf_pt_check_vmx_misc()) {
 		return false;
 	}
@@ -255,9 +354,27 @@ static bool perf_pt_preflight(void)
 		perf_pt_has_cr3_filtering = (v != 0);
 	}
 
-	nyx_debug("perf PT: pmu type=%u num_address_ranges=%u cr3_filtering=%d\n",
+	perf_pt_cr3_write_path = perf_pt_probe_cr3_write_path();
+
+	nyx_debug("perf PT: pmu type=%u num_address_ranges=%u cr3_filtering=%d "
+	          "cr3_write_path=%d\n",
 	          perf_pt_pmu_type, perf_pt_num_address_ranges,
-	          (int)perf_pt_has_cr3_filtering);
+	          (int)perf_pt_has_cr3_filtering, (int)perf_pt_cr3_write_path);
+
+	if (perf_pt_has_cr3_filtering && !perf_pt_cr3_write_path) {
+		/*
+		A warning, not a failure. A target that never calls pt_set_cr3 (a
+		single process guest, or an A/B run comparing address range coverage
+		only) is still perfectly valid on this kernel, so refusing to start
+		would block work that does not need CR3. The abort lives in
+		perf_configure_cr3(), at the point where the missing capability
+		actually matters.
+		*/
+		nyx_warn("perf PT: this CPU supports CR3 filtering but the kernel does "
+		         "not accept attr.config2, so pt_set_cr3() will fail. Targets "
+		         "needing per process filtering require the "
+		         "IA32_RTIT_CR3_MATCH write path patch.\n");
+	}
 
 	perf_pt_preflight_done = true;
 	return true;

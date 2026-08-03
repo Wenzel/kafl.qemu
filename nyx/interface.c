@@ -400,6 +400,19 @@ static bool verify_sharedir_state(nyx_interface_state *s, Error **errp)
 static void nyx_realize(DeviceState *dev, Error **errp)
 {
     nyx_interface_state *s = NYX_MEM(dev);
+    pt_backend_kind_t    pt_kind = PT_BACKEND_NONE;
+
+    /*
+    Parse pt_backend first, before the workdir and sharedir checks below.
+    Those abort on a missing directory, so validating the backend name after
+    them meant a typo was only reported once a fully populated workdir
+    already existed. This is pure validation; the actual selection happens
+    further down, once kvm_init()'s capability probe result can be consulted.
+    */
+    if (s->pt_backend && !pt_backend_kind_from_string(s->pt_backend, &pt_kind)) {
+        nyx_abort("Invalid pt_backend \"%s\" (expected vmx, perf or none)\n",
+                  s->pt_backend);
+    }
 
     if (s->bitmap_size <= 0) {
         s->bitmap_size = DEFAULT_NYX_BITMAP_SIZE;
@@ -443,12 +456,7 @@ static void nyx_realize(DeviceState *dev, Error **errp)
     capability probe in kvm_init() rather than having it overwritten here.
     */
     if (s->pt_backend) {
-        pt_backend_kind_t kind;
-
-        if (!pt_backend_kind_from_string(s->pt_backend, &kind)) {
-            nyx_abort("Invalid pt_backend \"%s\" (expected vmx, perf or none)\n",
-                      s->pt_backend);
-        }
+        pt_backend_kind_t kind = pt_kind;
 
         if (kind == PT_BACKEND_PERF && pt_backend_kind == PT_BACKEND_NONE) {
             /*
