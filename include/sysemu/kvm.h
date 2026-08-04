@@ -375,6 +375,15 @@ int kvm_arch_get_registers(CPUState *cpu);
 #define KVM_PUT_FULL_STATE_FAST      4
 
 int kvm_arch_get_registers_fast(CPUState *cpu);
+
+/*
+True once kvm_init() found no Nyx KVM module and fell back to trapping
+hypercalls through the VMware I/O backdoor (an "out" instruction) rather than
+through a custom vmcall exit. KVMState is opaque outside kvm-all.c, so this
+is the accessor for code elsewhere that needs to know which trap instruction
+is in play, such as adjust_rip() in fast_vm_reload_sync.c.
+*/
+bool kvm_nyx_no_pt_mode(void);
 #endif
 
 int kvm_arch_put_registers(CPUState *cpu, int level);

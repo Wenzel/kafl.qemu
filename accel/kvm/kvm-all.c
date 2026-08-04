@@ -2440,6 +2440,11 @@ static void kvm_eat_signals(CPUState *cpu)
 
 #ifdef QEMU_NYX
 // clang-format on
+bool kvm_nyx_no_pt_mode(void)
+{
+    return kvm_state->nyx_no_pt_mode;
+}
+
 static int handle_vmware_hypercall(struct kvm_run *run, CPUState *cpu)
 {
     kvm_arch_get_registers_fast(cpu);

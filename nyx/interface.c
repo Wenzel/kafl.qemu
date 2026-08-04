@@ -460,15 +460,25 @@ static void nyx_realize(DeviceState *dev, Error **errp)
 
         if (kind == PT_BACKEND_PERF && pt_backend_kind == PT_BACKEND_NONE) {
             /*
-            The capability probe already decided there is no PT here, which on
-            a stock kernel also means hypercalls have moved to the VMware I/O
-            backdoor. Combining that with a live PT session is a state the rest
-            of the code still asserts against, so refuse it explicitly instead
-            of half enabling it.
+            kvm_init() ran before this device was realized and, seeing no Nyx
+            KVM module, made two decisions at once: hypercalls move to the
+            VMware I/O backdoor (nyx_no_pt_mode, left alone, still correct),
+            and there is no Intel PT (nyx_pt / pt_trace_mode forced false,
+            which is wrong here). Those were bundled because on this code's
+            only prior stock-kernel path, no Nyx module really did mean no PT
+            at all. The perf backend breaks that bundling: it drives
+            perf_event_open() directly and was never conditioned on the Nyx
+            KVM module (see pt_backend_perf in pt_perf.c, which touches no
+            KVM_VMX_PT ioctl), so it works whether or not that module is
+            present. Un-force the two flags kvm_init() got wrong for this one
+            combination; nyx_no_pt_mode itself is untouched, since the
+            backdoor hypercall trap in kvm_cpu_exec() asserts exactly that
+            flag and nothing about which PT backend is running underneath it.
             */
-            nyx_abort("pt_backend=perf requires the Nyx KVM module for the "
-                      "hypercall path in this build. Running the perf backend "
-                      "on a stock kernel is not wired up yet.\n");
+            GET_GLOBAL_STATE()->nyx_pt        = true;
+            GET_GLOBAL_STATE()->pt_trace_mode = true;
+            nyx_debug("pt_backend=perf on a stock kernel: hypercalls via the "
+                      "VMware I/O backdoor, tracing via perf_event_open()\n");
         }
 
         pt_backend_select(kind);

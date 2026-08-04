@@ -26,13 +26,19 @@ extern int load_snapshot(const char *name, Error **errp);
 
 static void adjust_rip(CPUX86State *env, fast_reload_t *snapshot)
 {
-    /* PT mode relies on a custom kernel which uses 'vmcall' hypercalls instead of
-     * vmware-backdoor based hypercalls (via 'out' instructions). 
-     */
-    if (GET_GLOBAL_STATE()->nyx_pt == true){
+    /*
+    Which instruction trapped, vmcall (3 bytes) or the VMware backdoor's out
+    (1 byte), used to be implied by nyx_pt: no Nyx KVM module meant no PT
+    backend at all, which meant the backdoor, which meant out. The perf
+    backend breaks that implication, since it can supply PT tracing without
+    the Nyx KVM module, so nyx_pt can now be true while the trap is still
+    out. Key off kvm_nyx_no_pt_mode() instead, which tracks the trap
+    instruction directly and does not change with the PT backend selection.
+    */
+    if (!kvm_nyx_no_pt_mode()) {
         env->eip -= 3; /* vmcall */
     }
-    else{
+    else {
         env->eip -= 1; /* out */
     }
 }
