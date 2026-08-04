@@ -361,6 +361,21 @@ static void check_available_ipt_ranges(nyx_interface_state *s)
 {
     uint64_t addr_a, addr_b;
 
+    /*
+    KVM_CAP_NYX_PT gates the IP filter registers the Nyx KVM module exposes
+    for vmx_pt (KVM_VMX_PT_SETUP_FILTER and friends), read through
+    pt_setup_ip_filters() below. The perf backend configures its own address
+    filters directly via perf_configure_addr()/perf_enable_addr() in
+    pt_perf.c (PERF_ATTR_SIZE_VER5's addr_filters, no Nyx module involved),
+    so this whole function is answering a question the perf backend does not
+    ask. Without this guard, requesting pt_backend=perf on a kernel with no
+    Nyx module would abort here even though the CPU model check just above
+    already correctly downgraded to the backdoor path.
+    */
+    if (pt_backend_kind == PT_BACKEND_PERF) {
+        return;
+    }
+
     int kvm_fd = qemu_open("/dev/kvm", O_RDWR);
     if (kvm_fd == -1) {
         nyx_abort("Could not access KVM kernel module (/dev/kvm)!\n");
