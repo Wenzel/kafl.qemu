@@ -116,7 +116,14 @@ typedef struct pt_perf_cpu_state {
 
 	bool enabled;
 
-	/* Diagnostics, reported once at teardown rather than per iteration. */
+	/*
+	Diagnostics. truncated_regions also warns at the point of loss, since a
+	count that is only visible at teardown is no use to a run that is still
+	going. The rest are summarised periodically by perf_report_stats(),
+	deliberately not only at teardown: a fuzzing session runs for hours and
+	may never exit cleanly, so anything reported only on the way out may
+	never be reported at all.
+	*/
 	uint64_t regions;
 	uint64_t bytes_total;
 	uint64_t wrapped_regions;
@@ -518,6 +525,29 @@ synthetic PSB header, and terminate it with the sentinel.
 
 Returns the total decodable length, which is what pt.c hands to libxdc.
 */
+/*
+Summarise the counters every PT_PERF_STATS_INTERVAL regions.
+
+Interval based rather than at teardown because a fuzzing session is long lived
+and often killed rather than exited, so a teardown only report can easily never
+appear. Debug level: on a healthy run this is pure noise, and the one condition
+that genuinely needs attention (truncation) already warns at the point of loss.
+*/
+#define PT_PERF_STATS_INTERVAL 10000
+
+static void perf_report_stats(pt_perf_cpu_state_t *st)
+{
+	if (st->regions == 0 || (st->regions % PT_PERF_STATS_INTERVAL) != 0) {
+		return;
+	}
+
+	nyx_debug("perf PT: %lu regions, %lu KiB staged, %lu wrapped, %lu truncated\n",
+	          (unsigned long)st->regions,
+	          (unsigned long)(st->bytes_total / 1024),
+	          (unsigned long)st->wrapped_regions,
+	          (unsigned long)st->truncated_regions);
+}
+
 static int perf_stage_region(pt_perf_cpu_state_t *st, uint64_t tail, uint64_t head)
 {
 	uint64_t available = head - tail;
@@ -537,6 +567,21 @@ static int perf_stage_region(pt_perf_cpu_state_t *st, uint64_t tail, uint64_t he
 		worth and record it as truncated so the caller can flag the run.
 		*/
 		st->truncated_regions++;
+		/*
+		Warn every time rather than counting quietly. A truncated region
+		means coverage was produced and thrown away, which is exactly the
+		failure the differential gate exists to catch, and a fuzzer that
+		loses edges without saying so is worse than one that stops. Rate
+		limiting this would hide a run that truncates steadily, so the
+		noise is the point: if it appears, PT_PERF_AUX_PAGES is too small
+		for the target and the number needs raising.
+		*/
+		nyx_warn("perf PT: AUX ring overrun, %lu bytes produced but the ring "
+		         "holds %zu; discarding the oldest %lu bytes (truncated "
+		         "region %lu). Raise PT_PERF_AUX_PAGES.\n",
+		         (unsigned long)available, st->aux_size,
+		         (unsigned long)(available - st->aux_size),
+		         (unsigned long)st->truncated_regions);
 		tail      = head - st->aux_size;
 		available = st->aux_size;
 	}
@@ -596,6 +641,12 @@ static int perf_consume(pt_perf_cpu_state_t *st)
 	}
 
 	len = perf_stage_region(st, tail, head);
+
+	/*
+	Counting happens inside perf_stage_region, at its tail, not here. Doing it
+	in both places would double every figure.
+	*/
+	perf_report_stats(st);
 
 	__atomic_store_n(&st->base->aux_tail, head, __ATOMIC_RELEASE);
 

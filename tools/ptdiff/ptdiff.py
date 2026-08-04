@@ -51,11 +51,27 @@ logger = logging.getLogger(__name__)
 # bare global so compare() can read it without a global statement.
 own_tolerance = [0.03]
 
+# How much worse the cross-arm difference may be than the within-backend one
+# before it counts as a real difference. 1.5 rather than 1.0 because the
+# within-backend number is itself a single sample of a random quantity, and a
+# threshold set at exactly one sample of the noise fails roughly half the time
+# by construction.
+CALIB_SLACK = 1.5
+
 # Arguments this script consumes itself. Everything else is handed to kafl's
 # own parser untouched, so a target is described exactly as it would be for
 # kafl debug and no option list has to be mirrored here.
 OWN_ARGS = ("--corpus", "--backends", "--limit", "--report", "--repeat",
-            "--save-cores", "--baseline-tolerance")
+            "--save-cores", "--baseline-tolerance", "--dump-edges",
+            "--calibrate", "--keep-workdirs")
+
+
+# Own arguments that take no value. Splitting has to know about these, because
+# consuming the following token for a bare flag steals the next real argument:
+# "--calibrate --workdir /x" became own=["--calibrate", "--workdir"] and left
+# argparse to reject "--workdir" as unrecognised, with an error message pointing
+# at the wrong option entirely.
+OWN_FLAGS = ("--calibrate", "--keep-workdirs")
 
 
 def split_argv(argv):
@@ -66,7 +82,7 @@ def split_argv(argv):
         key = a.split("=", 1)[0]
         if key in OWN_ARGS:
             own.append(a)
-            if "=" not in a and i + 1 < len(argv):
+            if key not in OWN_FLAGS and "=" not in a and i + 1 < len(argv):
                 own.append(argv[i + 1])
                 i += 1
         else:
@@ -92,6 +108,27 @@ def parse_own(argv):
     # fs_fuzzer is 0.22%; a decoder dropping traces would be orders of magnitude
     # larger, so 2% separates them with room to spare.
     ap.add_argument("--baseline-tolerance", type=float, default=0.03)
+    # Directory to write per-input decoded edge traces. When set, enables
+    # trace_cb mode so QEMU writes edges as guest virtual addresses rather
+    # than only computing hashed bitmap indices.
+    #
+    # DIAGNOSTIC MODE, NOT A GATE MODE. trace_cb makes nyx install
+    # alt_bitmap_add() as the edge callback, and that writes into the SAME
+    # shared bitmap libxdc fills, using a different hash (mix_bits) than
+    # libxdc's own. The bitmap a run produces under --dump-edges is therefore a
+    # blend of two hash schemes and is not comparable with one produced without
+    # it. Use this to find out WHICH guest addresses two backends disagree on,
+    # then re-run without it to judge pass or fail.
+    ap.add_argument("--dump-edges", default=None)
+    # Run each backend TWICE and use each one's own session-to-session
+    # difference as the pass threshold, instead of a percentage picked in
+    # advance. See compare_calibrated() for why this supersedes
+    # --baseline-tolerance as the real criterion. Costs 2x runtime.
+    ap.add_argument("--calibrate", action="store_true", default=False)
+    # Each session's workdir is removed once it has been read. Keep them when
+    # inspecting serial logs or PT dumps by hand, and mind that every one costs
+    # about the guest RAM size.
+    ap.add_argument("--keep-workdirs", action="store_true", default=False)
     return ap.parse_args(argv)
 
 
@@ -113,8 +150,104 @@ def corpus_files(path, limit, repeat=1):
         out = out[:limit]
     return out * repeat if repeat > 1 else out
 
+def read_trace_edges(workdir, qid=1337):
+    """Parse the decoded edge trace file written by QEMU's trace_cb mode.
 
-def run_arm(backend, inputs, base_workdir):
+    Returns a list of (from, to, count) int triples, or an empty list if the
+    file is missing. Skips malformed lines rather than crashing, since a partial
+    trace is more useful than no output at all.
+
+    The file is written by redqueen_trace_flush() and holds one line per unique
+    edge in the format "from,to,count" where all three are lowercase hex without
+    a 0x prefix. It is truncated and rewritten per execution, so it must be read
+    immediately after send_payload() returns, before the next execution starts.
+    """
+    path = os.path.join(workdir, "redqueen_workdir_%d" % qid, "pt_trace_results.txt")
+    if not os.path.exists(path):
+        return []
+
+    edges = []
+    with open(path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split(",")
+            if len(parts) != 3:
+                # Malformed line, skip it rather than crashing the whole run.
+                continue
+            try:
+                from_addr = int(parts[0], 16)
+                to_addr = int(parts[1], 16)
+                count = int(parts[2], 16)
+                edges.append((from_addr, to_addr, count))
+            except ValueError:
+                # Not valid hex, skip this line.
+                continue
+    return edges
+
+
+# A kAFL workdir costs roughly the guest RAM size, because the root snapshot is
+# a full memory image: 538 MiB per session at -m 512. That is cheap once and
+# ruinous thirty times. --calibrate alone opens four.
+#
+# The number is a floor, not a limit. Leave real headroom.
+PREFLIGHT_MIB_PER_SESSION = 700
+
+
+def preflight_space(base_workdir, sessions):
+    """Refuse to start if the workdir filesystem cannot hold the sessions.
+
+    Worth a check of its own because of how this fails otherwise. A full tmpfs
+    does not produce ENOSPC anywhere legible: QEMU's snapshot writer does a short
+    fwrite and trips
+
+      nyx_device_state.c:476: nyx_device_state_serialize:
+      Assertion `fwrite(...) == self->state_buf_size' failed
+
+    and the harness reports "qemu failed to start", which reads like a backend
+    bug and sent me looking at pt_perf.c. Thirty leftover workdirs from earlier
+    runs had filled /dev/shm to 100%.
+    """
+    parent = os.path.dirname(os.path.abspath(base_workdir.rstrip("/"))) or "/"
+    try:
+        st = os.statvfs(parent)
+    except OSError as e:
+        # Not fatal. A missing statvfs is not a reason to refuse to run.
+        logger.warning("could not check free space on %s: %s", parent, e)
+        return
+
+    avail_mib = (st.f_bavail * st.f_frsize) // (1024 * 1024)
+    need_mib = sessions * PREFLIGHT_MIB_PER_SESSION
+
+    if avail_mib < need_mib:
+        raise RuntimeError(
+            "only %d MiB free on %s but %d session(s) need about %d MiB. "
+            "Stale kAFL workdirs from earlier runs are the usual cause; "
+            "remove them or point --workdir at a larger filesystem."
+            % (avail_mib, parent, sessions, need_mib))
+
+    logger.info("space check: %d MiB free on %s, %d session(s) need ~%d MiB",
+                avail_mib, parent, sessions, need_mib)
+
+
+def drop_workdir(workdir):
+    """Remove a finished session's workdir.
+
+    Called only on the success path. A workdir that belongs to a failed run is
+    left in place deliberately: serial_1337.log and the PT dumps inside it are
+    the only record of why the run failed, and deleting them during cleanup would
+    destroy the evidence at exactly the moment it matters.
+    """
+    try:
+        shutil.rmtree(workdir)
+    except OSError as e:
+        # A leaked workdir is a space problem for the next run, not a reason to
+        # discard the measurement this one just produced.
+        logger.warning("could not remove workdir %s: %s", workdir, e)
+
+
+def run_arm(backend, inputs, base_workdir, dump_edges=None, keep_workdir=False):
     """Replay every input under one backend: index -> (hash, exit, edges).
 
     Keyed by position rather than by path because --repeat intentionally puts the
@@ -151,6 +284,10 @@ def run_arm(backend, inputs, base_workdir):
         "purge": True,
         "resume": False,
         "qemu_extra": extra,
+        # Enable trace_cb when dump_edges is requested. This makes QEMU call
+        # redqueen_trace_init() to activate the libxdc edge callback, writing
+        # decoded edges to pt_trace_results.txt.
+        "trace_cb": bool(dump_edges),
     })
 
     # Creates the full skeleton, including snapshot/, which QEMU's
@@ -164,6 +301,14 @@ def run_arm(backend, inputs, base_workdir):
     q = qemu(1337, settings, debug_mode=False, notifiers=True, resume=False)
     if not q.start():
         raise RuntimeError("qemu failed to start for the %s arm" % backend)
+
+    # Arm trace mode if edge dumping is enabled. This must happen after start()
+    # succeeds, since the qemu object needs to be fully initialized before it
+    # can accept runtime mode changes.
+    if dump_edges:
+        q.set_trace_mode(True)
+        # Create the dump directory if it does not exist yet.
+        os.makedirs(dump_edges, exist_ok=True)
 
     results = {}
     try:
@@ -179,12 +324,37 @@ def run_arm(backend, inputs, base_workdir):
             bitmap = res.copy_to_array()
             edges = frozenset(i for i, v in enumerate(bitmap) if v)
             results[n] = (res.hash(), res.exit_reason, edges)
+
+            # Dump the decoded edge trace if requested. Read and write must
+            # happen here, after send_payload() but before the next execution,
+            # since the trace file is truncated on each run.
+            if dump_edges:
+                trace_edges = read_trace_edges(workdir, qid=1337)
+                # Convert frozenset-of-tuples to a list-of-lists so it is JSON
+                # serializable. Keep the int triples as they are.
+                dump_obj = {
+                    "backend": backend,
+                    "index": n,
+                    "path": path,
+                    "exit": str(res.exit_reason),
+                    "edges": [[f, t, c] for f, t, c in trace_edges],
+                }
+                dump_name = "%s_%d_%s.json" % (backend, n, os.path.basename(path))
+                dump_path = os.path.join(dump_edges, dump_name)
+                with open(dump_path, "w") as df:
+                    json.dump(dump_obj, df)
+
             if (n + 1) % 100 == 0:
                 logger.info("  %s: %d/%d", backend, n + 1, len(inputs))
     finally:
         # Unconditional: an arm left running would clobber the next one's
         # trace source, per the module docstring.
         q.shutdown()
+
+    # Only past the try, so this runs on success and not after an exception.
+    # See drop_workdir: a failed run's workdir is the evidence.
+    if not keep_workdir:
+        drop_workdir(workdir)
 
     return results
 
@@ -279,6 +449,142 @@ def signatures(cores):
     """
     base = session_baseline(cores)
     return {path: frozenset(core) - base for path, (core, _u) in cores.items()}
+
+
+def compare_calibrated(inputs, backends, sessions):
+    """The differential criterion, with the threshold measured rather than guessed.
+
+    Why this supersedes the fixed percentage tolerance
+    -------------------------------------------------
+
+    The tolerance in compare_cores() was chosen from measurements and still
+    failed, for a reason no choice of constant can fix. Measured on fs_fuzzer
+    with symbolised guest addresses rather than hashed bitmap indices:
+
+      - Two SAME-BACKEND sessions differ by 50 to 54 edges (vmx vs vmx: 54,
+        perf vs perf: 50).
+      - The two ARMS differ by 63 edges in the same units.
+      - Repeats of one input inside a single session span 126 edges
+        (11722, 11846, 11848).
+
+    So the quantity under test is smaller than the noise it is compared against,
+    and expressing it as a percentage makes matters worse by dividing a roughly
+    constant absolute difference by a varying denominator. The same ~52 edge gap
+    scored 2.94% on ext2 (pass) and 3.36% on garbage (fail) in one run, and
+    ext4_big flipped from pass to fail between two runs of identical code.
+
+    The fix is to stop guessing the threshold. Run each backend twice and use
+    each backend's own cross-session difference as the yardstick:
+
+        cross-arm difference <= CALIB_SLACK * max(within-backend differences)
+
+    That is a control, not a constant. It adapts to a noisy target on its own, it
+    cannot be defeated by a denominator, and on a genuinely quiet target it
+    tightens automatically. What it gives up is absolute sensitivity: on a target
+    this noisy it cannot see a defect smaller than the target's own jitter. That
+    is a true statement about the target, and the honest response is to report
+    the floor rather than pick a constant that hides it.
+
+    Note the direction of the remaining risk. This criterion can be fooled by a
+    defect that is stable WITHIN a backend, because such a defect inflates the
+    within-backend and the cross-arm numbers together. Address level inspection
+    (--dump-edges) covers that case, and is how the NR filter was checked for
+    host leakage. The two are complementary and neither alone is sufficient.
+
+    sessions maps backend -> list of exactly two arm result dicts.
+    """
+    print()
+    print("=== calibrated differential criterion ===")
+    print("threshold per input = %.1fx the larger within-backend session difference"
+          % CALIB_SLACK)
+    print("(a measured control, not a chosen constant; see compare_calibrated)")
+    print()
+
+    # Within-backend cores, one per session, so each backend is compared against
+    # itself before the arms are compared against each other.
+    within = {}
+    for be in backends:
+        a, b = sessions[be]
+        within[be] = (stable_cores(inputs, a), stable_cores(inputs, b))
+
+    ref = backends[0]
+    rc = 0
+    empty = (frozenset(), frozenset())
+
+    for other in backends[1:]:
+        bad, degenerate, ok_count, floors = [], [], 0, []
+
+        for path in sorted(within[ref][0]):
+            name = os.path.basename(path)
+
+            ra = within[ref][0].get(path, empty)[0]
+            rb = within[ref][1].get(path, empty)[0]
+            oa = within[other][0].get(path, empty)[0]
+            ob = within[other][1].get(path, empty)[0]
+
+            if not (ra or rb or oa or ob):
+                degenerate.append(path)
+                print("  %-24s EMPTY on all sessions (proves nothing)" % name)
+                continue
+
+            # One arm silent while the other traced is damning regardless of any
+            # threshold, so it short circuits.
+            if (not (ra or rb)) or (not (oa or ob)):
+                bad.append(path)
+                print("  %-24s FAIL  one arm produced no coverage at all "
+                      "(%s %d/%d, %s %d/%d)"
+                      % (name, ref, len(ra), len(rb), other, len(oa), len(ob)))
+                continue
+
+            self_ref = len(ra ^ rb)
+            self_other = len(oa ^ ob)
+            noise = max(self_ref, self_other)
+
+            # Compare session 0 against session 0 so both sides are measured
+            # under the same repeat count and input ordering.
+            cross = len(ra ^ oa)
+
+            # An absolute floor of 1 stops a target that happens to be perfectly
+            # stable in both arms from setting a threshold of zero, where a
+            # single edge of any origin would fail the gate.
+            threshold = max(1.0, CALIB_SLACK * noise)
+            floors.append(noise)
+
+            if cross > threshold:
+                bad.append(path)
+                verdict = "FAIL"
+            else:
+                ok_count += 1
+                verdict = "ok"
+
+            print("  %-24s %-4s cross %4d  vs threshold %6.1f  (self: %s %d, %s %d)"
+                  % (name, verdict, cross, threshold,
+                     ref, self_ref, other, self_other))
+
+        print()
+        if bad:
+            rc = 1
+            print("%d input(s) differ between arms by MORE than the same-backend "
+                  "control allows." % len(bad))
+            print("That is the only form of evidence this target can support for a "
+                  "decode difference.")
+        else:
+            print("all %d comparable input(s): the arms differ no more than each "
+                  "backend differs from itself" % ok_count)
+
+        if floors:
+            print()
+            print("Measured sensitivity floor on this target: a defect smaller than "
+                  "about %d edges" % max(floors))
+            print("cannot be distinguished from the target's own session-to-session "
+                  "noise.")
+
+        if degenerate:
+            print("%d input(s) traced nothing anywhere: %s"
+                  % (len(degenerate),
+                     ", ".join(os.path.basename(p) for p in degenerate)))
+
+    return rc
 
 
 def compare_cores(inputs, backends, arms, tolerance=0.03):
@@ -498,9 +804,61 @@ def main():
     backends = [b.strip() for b in own.backends.split(",") if b.strip()]
     base_workdir = settings.workdir
 
+    if own.dump_edges:
+        logger.warning("--dump-edges is set: trace_cb rewires the edge callback "
+                       "to alt_bitmap_add(), which hashes differently than "
+                       "libxdc. Treat the bitmap verdicts below as MEANINGLESS "
+                       "and read the dumped address sets instead.")
+
+    if own.calibrate:
+        if len(backends) < 2:
+            print("--calibrate needs at least two backends to compare",
+                  file=sys.stderr)
+            return 2
+        if own.repeat < 2:
+            print("--calibrate needs --repeat >= 2: a stable core is undefined "
+                  "from a single execution", file=sys.stderr)
+            return 2
+
+        # Two sessions per backend, and the ORDER matters. Interleaving the
+        # backends (ref, other, ref, other) rather than grouping them
+        # (ref, ref, other, other) keeps a slow drift in machine state, page
+        # cache warmth, thermal behaviour, whatever else, from landing entirely
+        # on one arm and being read as a backend difference. The within-backend
+        # pairs are then separated by the same amount of wall clock as the
+        # cross-arm pair, which is the comparison the criterion depends on.
+        # Only one session's workdir exists at a time unless --keep-workdirs
+        # is set, so the requirement is 1 rather than the 2 * len(backends)
+        # sessions the loop opens in total.
+        preflight_space(base_workdir,
+                        2 * len(backends) if own.keep_workdirs else 1)
+
+        sessions = {be: [] for be in backends}
+        for round_no in (0, 1):
+            for backend in backends:
+                logger.info("=== calibration round %d, backend %s ===",
+                            round_no, backend)
+                sessions[backend].append(
+                    run_arm(backend, inputs,
+                            "%s_r%d" % (base_workdir.rstrip("/"), round_no),
+                            dump_edges=own.dump_edges,
+                            keep_workdir=own.keep_workdirs))
+
+        rc = compare_calibrated(inputs, backends, sessions)
+
+        # Also print the old per-input view from round 0, since the calibrated
+        # criterion reports differences without saying how big the cores were.
+        for backend in backends:
+            report_repeats(backend, inputs, sessions[backend][0])
+        return rc
+
+    preflight_space(base_workdir, len(backends) if own.keep_workdirs else 1)
+
     arms = {}
     for backend in backends:
-        arms[backend] = run_arm(backend, inputs, base_workdir)
+        arms[backend] = run_arm(backend, inputs, base_workdir,
+                                dump_edges=own.dump_edges,
+                                keep_workdir=own.keep_workdirs)
 
     if len(arms) < 2:
         name = backends[0]
