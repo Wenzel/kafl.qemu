@@ -4484,11 +4484,30 @@ static void x86_cpuid_set_model_id(Object *obj, const char *model_id,
         model_id = "";
     }
 #ifdef QEMU_NYX
-    if(strncmp(model_id, NYX_PT_CPU_MODEL, strlen(NYX_PT_CPU_MODEL)) == 0 && GET_GLOBAL_STATE()->nyx_pt == false){
+    /*
+    This CPUID string is the guest's only way to learn which hypercall trap
+    mechanism is available: libnyx_agent's _get_nyx_cpu_type() reads it back
+    and picks vmcall (PT model) or the VMware backdoor (NO-PT model)
+    accordingly. That is a question about which trap instruction the guest
+    can use, the same question adjust_rip() answers in
+    fast_vm_reload_sync.c, and it used to be answerable from nyx_pt because
+    the two were perfect opposites. The perf backend decouples them: nyx_pt
+    can now be true (there is a live PT session) while no Nyx KVM module is
+    present (the guest still has to use the backdoor). Check
+    kvm_nyx_no_pt_mode() instead, which tracks the trap mechanism directly,
+    so a guest that does not explicitly request the NO-PT model still gets
+    correctly downgraded to it when the backdoor is the only path available,
+    and the CPUID string keeps telling the guest the truth.
+    */
+    if (strncmp(model_id, NYX_PT_CPU_MODEL, strlen(NYX_PT_CPU_MODEL)) == 0 &&
+        kvm_nyx_no_pt_mode())
+    {
         fprintf(stderr, "[QEMU-Nyx] Warning: Attempt to use unsupported CPU model (PT) without KVM-PT (Hint: use '-cpu kAFL64-Hypervisor-v2' instead)\n");
         model_id = NYX_NO_PT_CPU_MODEL;
     }
-    if(strncmp(model_id, NYX_NO_PT_CPU_MODEL, strlen(NYX_NO_PT_CPU_MODEL)) == 0 && GET_GLOBAL_STATE()->nyx_pt == true){
+    if (strncmp(model_id, NYX_NO_PT_CPU_MODEL, strlen(NYX_NO_PT_CPU_MODEL)) == 0 &&
+        !kvm_nyx_no_pt_mode())
+    {
         fprintf(stderr, "[QEMU-Nyx] Error: Attempt to use unsupported CPU model (NO-PT) with KVM-PT (Hint: use '-cpu kAFL64-Hypervisor-v1' instead)\n");
         exit(1);
     }
