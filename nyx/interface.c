@@ -362,15 +362,37 @@ static void check_available_ipt_ranges(nyx_interface_state *s)
     uint64_t addr_a, addr_b;
 
     /*
+    Populating pt_ip_filter_configured/a/b[] from the -ip0.._ip3 device
+    properties is NOT specific to vmx_pt: pt_perf.c's own hardware
+    SET_FILTER programming and libxdc's software filter both read that same
+    global state. Only the block below this comment answers a
+    vmx_pt-specific question (does the Nyx KVM module expose
+    KVM_CAP_NYX_PT / how many hardware range registers does it have), so
+    only that part may be skipped for the perf backend. An earlier version
+    of this function returned before ever reaching pt_setup_ip_filters(),
+    which silently dropped all host-configured IP filters under
+    pt_backend=perf (measured: --ip0 had zero effect on trace size).
+    */
+    for (uint8_t i = 0; i < INTEL_PT_MAX_RANGES; i++) {
+        if (s->ip_filter[i][0] && s->ip_filter[i][1]) {
+            addr_a = CONVERT_UINT64(s->ip_filter[i][0]);
+            addr_b = CONVERT_UINT64(s->ip_filter[i][1]);
+            if (addr_a < addr_b) {
+                pt_setup_ip_filters(i, addr_a, addr_b);
+            }
+        }
+    }
+
+    /*
     KVM_CAP_NYX_PT gates the IP filter registers the Nyx KVM module exposes
-    for vmx_pt (KVM_VMX_PT_SETUP_FILTER and friends), read through
-    pt_setup_ip_filters() below. The perf backend configures its own address
-    filters directly via perf_configure_addr()/perf_enable_addr() in
-    pt_perf.c (PERF_ATTR_SIZE_VER5's addr_filters, no Nyx module involved),
-    so this whole function is answering a question the perf backend does not
-    ask. Without this guard, requesting pt_backend=perf on a kernel with no
-    Nyx module would abort here even though the CPU model check just above
-    already correctly downgraded to the backdoor path.
+    for vmx_pt (KVM_VMX_PT_SETUP_FILTER and friends). The perf backend
+    configures its own address filters directly via
+    perf_configure_addr()/perf_enable_addr() in pt_perf.c
+    (PERF_ATTR_SIZE_VER5's addr_filters, no Nyx module involved), so this
+    probe is answering a question the perf backend does not ask. Without
+    this guard, requesting pt_backend=perf on a kernel with no Nyx module
+    would abort here even though the CPU model check just above already
+    correctly downgraded to the backdoor path.
     */
     if (pt_backend_kind == PT_BACKEND_PERF) {
         return;
@@ -382,16 +404,9 @@ static void check_available_ipt_ranges(nyx_interface_state *s)
     }
 
     if (ioctl(kvm_fd, KVM_CHECK_EXTENSION, KVM_CAP_NYX_PT) == 1) {
-        for (uint8_t i = 0; i < INTEL_PT_MAX_RANGES; i++) {
+        for (uint8_t i = 1; i < INTEL_PT_MAX_RANGES; i++) {
             if (s->ip_filter[i][0] && s->ip_filter[i][1]) {
-                if (i >= 1) {
-                    check_ipt_range(i);
-                }
-                addr_a = CONVERT_UINT64(s->ip_filter[i][0]);
-                addr_b = CONVERT_UINT64(s->ip_filter[i][1]);
-                if (addr_a < addr_b) {
-                    pt_setup_ip_filters(i, addr_a, addr_b);
-                }
+                check_ipt_range(i);
             }
         }
     }

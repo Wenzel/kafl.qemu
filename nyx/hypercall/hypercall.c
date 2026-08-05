@@ -398,11 +398,24 @@ static void handle_hypercall_kafl_cr3(struct kvm_run *run,
                                       uint64_t        hypercall_arg)
 {
     if (hypercall_enabled) {
-        nyx_debug_p(CORE_PREFIX, "Setting CR3 filter: %lx\n", hypercall_arg);
-        pt_set_cr3(cpu, hypercall_arg & 0xFFFFFFFFFFFFF000ULL, false);
+        /*
+        UINT64_MAX is a sentinel, not a legal CR3 (bit 0 of a real CR3 is
+        never page-aligned to begin with, since this path already masks to a
+        4K boundary below): "use the CR3 this vCPU's own GET_PAYLOAD call
+        already captured into parent_cr3." Exists because a ring-3 guest
+        process cannot read its own %cr3 (CPL0-only instruction), so a
+        target that wants to filter by its own process has no other way to
+        learn the value to submit. Any real CR3 value, including 0, is
+        passed through unchanged, so this does not change behaviour for
+        existing targets that submit a real address.
+        */
+        uint64_t cr3 = (hypercall_arg == UINT64_MAX)
+                           ? GET_GLOBAL_STATE()->parent_cr3
+                           : (hypercall_arg & 0xFFFFFFFFFFFFF000ULL);
+        nyx_debug_p(CORE_PREFIX, "Setting CR3 filter: %lx\n", cr3);
+        pt_set_cr3(cpu, cr3, false);
         if (GET_GLOBAL_STATE()->dump_page) {
-            set_page_dump_bp(cpu, hypercall_arg & 0xFFFFFFFFFFFFF000ULL,
-                             GET_GLOBAL_STATE()->dump_page_addr);
+            set_page_dump_bp(cpu, cr3, GET_GLOBAL_STATE()->dump_page_addr);
         }
     }
 }

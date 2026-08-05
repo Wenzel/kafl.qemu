@@ -853,6 +853,20 @@ static int perf_configure_cr3(CPUState *cpu, uint64_t cr3)
 	attr.disabled       = 1;
 	attr.exclude_kernel = 0;
 
+	/*
+	Intel PT is exclusive-use per thread: opening the replacement event
+	while st->fd is still open gets EBUSY from the kernel, not a graceful
+	fallback, because both events would be requesting the same hardware PT
+	resource on the same vCPU thread simultaneously. So the old event (and
+	its mappings, which pin a reference to the fd) must be torn down FIRST,
+	then the new one opened. The window between close and open has no PT
+	resource at all, which is fine here: pt_set_cr3() already refuses to
+	run this while cpu->pt_enabled, so no trace can be lost mid-swap.
+	*/
+	munmap(st->aux, st->aux_size);
+	munmap(st->base, st->base_size);
+	close(st->fd);
+
 	fd = perf_event_open_syscall(&attr, 0, -1, -1, 0);
 	if (fd < 0) {
 		if (errno == EINVAL && cr3 != 0) {
@@ -864,15 +878,6 @@ static int perf_configure_cr3(CPUState *cpu, uint64_t cr3)
 		nyx_abort("perf PT: reopening the event for CR3 filtering failed: %s\n",
 		          strerror(errno));
 	}
-
-	/*
-	Swap the fd and remap. The staging buffer is deliberately kept, so
-	cpu->pt_mmap does not move and nothing upstream needs to know this
-	happened.
-	*/
-	munmap(st->aux, st->aux_size);
-	munmap(st->base, st->base_size);
-	close(st->fd);
 
 	st->fd   = (int)fd;
 	st->base = mmap(NULL, st->base_size, PROT_READ | PROT_WRITE, MAP_SHARED,
