@@ -126,6 +126,36 @@ const char *pt_backend_kind_to_string(pt_backend_kind_t kind)
 	}
 }
 
+pt_cr3_filter_mode_t pt_cr3_filter_mode = PT_CR3_FILTER_HW;
+
+bool pt_cr3_filter_mode_from_string(const char *name, pt_cr3_filter_mode_t *out)
+{
+	if (!name) {
+		return false;
+	}
+	if (!strcmp(name, "hw")) {
+		*out = PT_CR3_FILTER_HW;
+		return true;
+	}
+	if (!strcmp(name, "sw")) {
+		*out = PT_CR3_FILTER_SW;
+		return true;
+	}
+	return false;
+}
+
+const char *pt_cr3_filter_mode_to_string(pt_cr3_filter_mode_t mode)
+{
+	switch (mode) {
+	case PT_CR3_FILTER_HW:
+		return "hw";
+	case PT_CR3_FILTER_SW:
+		return "sw";
+	default:
+		return "invalid";
+	}
+}
+
 static void pt_set(CPUState *cpu, run_on_cpu_data arg)
 {
 	asm volatile("" ::: "memory");
@@ -222,6 +252,35 @@ int pt_set_cr3(CPUState *cpu, uint64_t val, bool hmp_mode)
 	if (cpu->pt_enabled) {
 		return -EINVAL;
 	}
+
+	/*
+	Software CR3 filtering (zero-kernel-patch perf PoC): route target_cr3
+	straight into libxdc instead of reconfiguring hardware. There is nothing
+	to reconfigure in hardware - the perf event keeps tracing every CR3
+	unconditionally and libxdc discards the rest during decode - so this
+	skips backend->configure_cr3/enable_cr3 entirely. That matters on a host
+	without the RTIT_CR3_MATCH write path patch (or without the Nyx module at
+	all): those pt_cmd()s would otherwise hit the hardware path's abort in
+	perf_configure_cr3()/vmx_configure_cr3.
+
+	decoder can still be NULL here: a target's first CR3 submission (right
+	after its first GET_PAYLOAD, to capture parent_cr3) routinely races
+	ahead of the ACQUIRE handshake that calls pt_init_decoder() for the first
+	time, and libxdc_enable_cr3_filter() asserts on a NULL self. Storing
+	pt_c3_filter now is enough either way: pt_init_decoder() reads it back as
+	the initial target_cr3 once it does run (see the traces_vmx_root block
+	below), so a decoder created after this call still starts up with the
+	right filter. A decoder that already exists gets updated live, same as
+	the hardware path below does with pt_cmd().
+	*/
+	if (pt_cr3_filter_mode == PT_CR3_FILTER_SW) {
+		GET_GLOBAL_STATE()->pt_c3_filter = val;
+		if (GET_GLOBAL_STATE()->decoder) {
+			libxdc_enable_cr3_filter(GET_GLOBAL_STATE()->decoder, true, val);
+		}
+		return 0;
+	}
+
 	if (GET_GLOBAL_STATE()->pt_c3_filter && GET_GLOBAL_STATE()->pt_c3_filter != val) {
 		// nyx_debug_p(PT_PREFIX, "Reconfigure CR3-Filtering!\n");
 		GET_GLOBAL_STATE()->pt_c3_filter = val;
@@ -324,6 +383,22 @@ void pt_init_decoder(CPUState *cpu)
 		libxdc_enable_nr_filter(GET_GLOBAL_STATE()->decoder, true);
 		nyx_debug("PT: libxdc NR filtering enabled for the %s backend\n",
 		          backend->name);
+
+		/*
+		Software CR3 filtering only makes sense here: it needs the same host
+		wide, PIP carrying stream the NR filter above needs. target_cr3 starts
+		at whatever pt_c3_filter currently holds (usually 0, i.e. suppress
+		until the guest submits a real CR3 via pt_set_cr3(), which re-enables
+		this with the real value); nyx_realize() already refused
+		pt_cr3_filter_mode=sw against any other backend.
+		*/
+		if (pt_cr3_filter_mode == PT_CR3_FILTER_SW) {
+			libxdc_enable_cr3_filter(GET_GLOBAL_STATE()->decoder, true,
+			                          GET_GLOBAL_STATE()->pt_c3_filter);
+			nyx_debug("PT: libxdc CR3 filtering enabled for the %s backend "
+			          "(target=0x%lx)\n",
+			          backend->name, GET_GLOBAL_STATE()->pt_c3_filter);
+		}
 	}
 
 	libxdc_register_bb_callback(GET_GLOBAL_STATE()->decoder,

@@ -160,4 +160,31 @@ const char *pt_backend_kind_to_string(pt_backend_kind_t kind);
 extern const pt_backend_t pt_backend_vmx;
 extern const pt_backend_t pt_backend_perf;
 
+/*
+How the target CR3 given to pt_set_cr3() gets enforced. Only meaningful for
+the perf backend; traces_vmx_root is what actually gates it (see
+pt_init_decoder() in pt.c).
+
+HW (default) reconfigures the trace source's own hardware filter
+(attr.config2/IA32_RTIT_CR3_MATCH for perf, the vmx_pt ioctl for vmx), so
+non-matching execution never reaches the decode buffer at all.
+
+SW is the zero-kernel-patch PoC: the perf event keeps tracing every CR3 the
+vCPU thread executes, unfiltered, and libxdc's software CR3 filter
+(libxdc_enable_cr3_filter) discards everything but target_cr3 during decode.
+Proves the whole pipeline needs no RTIT_CR3_MATCH kernel patch, at the cost of
+decoding a much larger unfiltered stream.
+*/
+typedef enum pt_cr3_filter_mode {
+	PT_CR3_FILTER_HW = 0,
+	PT_CR3_FILTER_SW,
+} pt_cr3_filter_mode_t;
+
+/* Selected once at startup from the -nyx-pt-cr3-filter-mode option; read
+ * everywhere else. */
+extern pt_cr3_filter_mode_t pt_cr3_filter_mode;
+
+bool pt_cr3_filter_mode_from_string(const char *name, pt_cr3_filter_mode_t *out);
+const char *pt_cr3_filter_mode_to_string(pt_cr3_filter_mode_t mode);
+
 #endif

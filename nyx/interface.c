@@ -99,6 +99,9 @@ typedef struct nyx_interface_state {
 
     /* "vmx" (default) or "perf"; see nyx/pt_backend.h */
     char *pt_backend;
+
+    /* "hw" (default) or "sw", perf backend only; see nyx/pt_backend.h */
+    char *pt_cr3_filter_mode;
 } nyx_interface_state;
 
 static void nyx_interface_event(void *opaque, int event)
@@ -431,6 +434,7 @@ static void nyx_realize(DeviceState *dev, Error **errp)
 {
     nyx_interface_state *s = NYX_MEM(dev);
     pt_backend_kind_t    pt_kind = PT_BACKEND_NONE;
+    pt_cr3_filter_mode_t cr3_filter_kind = PT_CR3_FILTER_HW;
 
     /*
     Parse pt_backend first, before the workdir and sharedir checks below.
@@ -442,6 +446,12 @@ static void nyx_realize(DeviceState *dev, Error **errp)
     if (s->pt_backend && !pt_backend_kind_from_string(s->pt_backend, &pt_kind)) {
         nyx_abort("Invalid pt_backend \"%s\" (expected vmx, perf or none)\n",
                   s->pt_backend);
+    }
+
+    if (s->pt_cr3_filter_mode &&
+        !pt_cr3_filter_mode_from_string(s->pt_cr3_filter_mode, &cr3_filter_kind)) {
+        nyx_abort("Invalid pt_cr3_filter_mode \"%s\" (expected hw or sw)\n",
+                  s->pt_cr3_filter_mode);
     }
 
     if (s->bitmap_size <= 0) {
@@ -515,6 +525,21 @@ static void nyx_realize(DeviceState *dev, Error **errp)
         nyx_debug("PT backend: %s\n", pt_backend_kind_to_string(kind));
     }
 
+    /*
+    Software CR3 filtering only means anything against the perf backend's
+    host wide trace stream: it needs the PIP packets and the unfiltered CR3
+    range that only that backend produces. vmx_pt's hardware trace already
+    excludes everything but the guest and emits no PIP to key on, so pairing
+    sw filtering with it would silently suppress all coverage rather than do
+    anything useful. Checked after backend selection above, so this sees the
+    backend that will actually run.
+    */
+    if (cr3_filter_kind == PT_CR3_FILTER_SW && pt_backend_kind != PT_BACKEND_PERF) {
+        nyx_abort("pt_cr3_filter_mode=sw requires pt_backend=perf\n");
+    }
+    pt_cr3_filter_mode = cr3_filter_kind;
+    nyx_debug("PT CR3 filter mode: %s\n", pt_cr3_filter_mode_to_string(cr3_filter_kind));
+
     check_available_ipt_ranges(s);
 
     pt_setup_enable_hypercalls();
@@ -557,6 +582,7 @@ static Property nyx_interface_properties[] = {
                        aux_buffer_size,
                        DEFAULT_AUX_BUFFER_SIZE),
     DEFINE_PROP_STRING("pt_backend", nyx_interface_state, pt_backend),
+    DEFINE_PROP_STRING("pt_cr3_filter_mode", nyx_interface_state, pt_cr3_filter_mode),
 
 
     DEFINE_PROP_END_OF_LIST(),
