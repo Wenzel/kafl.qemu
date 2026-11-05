@@ -89,6 +89,7 @@ directory rather than trusted blindly; see perf_pt_read_config_bits().
 #define PT_CFG_PT       (1ULL << 0)
 #define PT_CFG_BRANCH   (1ULL << 13)
 #define PT_CFG_NORETCOMP (1ULL << 11)
+#define PT_CFG_CR3_FILTER (1ULL << 7)  /* RTIT_CTL_CR3EN, the cr3_filter format bit */
 
 /* 8 times PSB (02 82) then PSBEND (02 23). See SDM 33.4.2.17 / 33.4.2.18. */
 static const uint8_t pt_psb_header[18] = {
@@ -260,21 +261,22 @@ static bool perf_pt_check_pt_mode(void)
 }
 
 /*
-Probe whether this kernel honours attr.config2 as IA32_RTIT_CR3_MATCH.
+Probe whether this kernel can program IA32_RTIT_CR3_MATCH through perf.
 
-The write path is out of tree, so detect it rather than assume it. Vanilla
-pt_event_valid() has no config2 branch at all and PMUs reject unknown
-config2 bits, so an unpatched kernel fails this open with EINVAL while a
-patched one accepts it.
+The interface is the cr3_filter format bit (attr.config bit 7) plus the
+match value in attr.config1. A kernel without the feature rejects config bit
+7 with EINVAL because it is outside the driver's config mask; a kernel with
+it accepts the open, but requires the privilege of kernel tracing
+(perf_event_paranoid <= 1 or CAP_PERFMON) and answers EACCES without it.
 
 Done once at startup on a throwaway event, because the alternative is
 discovering it at the first pt_set_cr3() call, which happens well into a
 campaign and after the fuzzer has already reported itself as running. There
 is no software fallback for CR3, so late detection means a wasted run.
 
-A non-EINVAL failure is reported as "unknown" rather than "absent": if the
-open failed for an unrelated reason the probe simply did not answer, and
-claiming the patch is missing would send the reader after the wrong problem.
+Any other failure is reported as "unknown" rather than "absent": if the open
+failed for an unrelated reason the probe simply did not answer, and claiming
+the feature is missing would send the reader after the wrong problem.
 */
 static bool perf_pt_probe_cr3_write_path(void)
 {
@@ -288,7 +290,8 @@ static bool perf_pt_probe_cr3_write_path(void)
 	memset(&attr, 0, sizeof(attr));
 	attr.size     = sizeof(attr);
 	attr.type     = perf_pt_pmu_type;
-	attr.config   = PT_CFG_PT | PT_CFG_BRANCH | PT_CFG_NORETCOMP;
+	attr.config   = PT_CFG_PT | PT_CFG_BRANCH | PT_CFG_NORETCOMP |
+	                PT_CFG_CR3_FILTER;
 	attr.disabled = 1;
 
 	/*
@@ -296,7 +299,7 @@ static bool perf_pt_probe_cr3_write_path(void)
 	reserved and must be zero, so 0x1000 exercises the accept path without
 	depending on any real guest CR3.
 	*/
-	attr.config2 = 0x1000;
+	attr.config1 = 0x1000;
 
 	fd = perf_event_open_syscall(&attr, 0, -1, -1, 0);
 	if (fd >= 0) {
@@ -305,8 +308,12 @@ static bool perf_pt_probe_cr3_write_path(void)
 	}
 
 	if (errno == EINVAL) {
-		nyx_debug("perf PT: attr.config2 rejected with EINVAL, so this kernel "
-		          "lacks the IA32_RTIT_CR3_MATCH write path\n");
+		nyx_debug("perf PT: cr3_filter (config bit 7) rejected with EINVAL, so "
+		          "this kernel lacks the IA32_RTIT_CR3_MATCH write path\n");
+	} else if (errno == EACCES) {
+		nyx_warn("perf PT: cr3_filter needs the privilege of kernel tracing "
+		         "(perf_event_paranoid <= 1 or CAP_PERFMON). Treating CR3 "
+		         "filtering as unavailable.\n");
 	} else {
 		nyx_warn("perf PT: the CR3 write path probe could not be answered "
 		         "(%s). Treating it as unavailable.\n", strerror(errno));
@@ -378,7 +385,7 @@ static bool perf_pt_preflight(void)
 		actually matters.
 		*/
 		nyx_warn("perf PT: this CPU supports CR3 filtering but the kernel does "
-		         "not accept attr.config2, so pt_set_cr3() will fail. Targets "
+		         "not accept the cr3_filter bit, so pt_set_cr3() will fail. Targets "
 		         "needing per process filtering require the "
 		         "IA32_RTIT_CR3_MATCH write path patch.\n");
 	}
@@ -816,15 +823,16 @@ static int perf_disable_addr(CPUState *cpu, uint8_t addrn)
 }
 
 /*
-Hardware CR3 filtering, via attr.config2.
+Hardware CR3 filtering, via the cr3_filter bit (attr.config bit 7) and the
+match value in attr.config1.
 
-This needs the out of tree patch that wires attr.config2 to
-IA32_RTIT_CR3_MATCH. Unlike the IP ranges there is no software fallback:
+This needs a kernel whose intel_pt driver can program IA32_RTIT_CR3_MATCH
+from perf (the "Allow filtering trace generation by CR3" patch). Unlike the IP ranges there is no software fallback:
 libxdc has no notion of CR3, so a host without the patch cannot filter by
 process at all, and a fuzzer that silently traces every process in the guest
 would fold unrelated coverage into one bitmap. Hence the hard failure.
 
-config2 can only be set at open time, so the event is closed and reopened.
+The CR3 filter can only be set at open time, so the event is closed and reopened.
 That is acceptable because pt.c refuses to change the CR3 filter while
 tracing is enabled (pt_set_cr3 returns EINVAL if cpu->pt_enabled), so this
 only ever runs between iterations.
@@ -849,7 +857,16 @@ static int perf_configure_cr3(CPUState *cpu, uint64_t cr3)
 	attr.size           = sizeof(attr);
 	attr.type           = perf_pt_pmu_type;
 	attr.config         = PT_CFG_PT | PT_CFG_BRANCH | PT_CFG_NORETCOMP;
-	attr.config2        = cr3;
+	if (cr3) {
+		/* Bits 4:0 of IA32_RTIT_CR3_MATCH are reserved; the kernel refuses them. */
+		if (cr3 & 0x1fULL) {
+			nyx_abort("perf PT: CR3 0x%lx has bits 4:0 set, which the hardware "
+			          "reserves. Clear the PCID and flag bits before submitting.\n",
+			          cr3);
+		}
+		attr.config  |= PT_CFG_CR3_FILTER;
+		attr.config1  = cr3;
+	}
 	attr.disabled       = 1;
 	attr.exclude_kernel = 0;
 
@@ -869,8 +886,11 @@ static int perf_configure_cr3(CPUState *cpu, uint64_t cr3)
 
 	fd = perf_event_open_syscall(&attr, 0, -1, -1, 0);
 	if (fd < 0) {
+		if (errno == EACCES && cr3 != 0) {
+			nyx_abort("perf PT: cr3_filter, cr3=0x%lx was refused with EACCES. CR3 filtering needs the privilege of kernel tracing: perf_event_paranoid <= 1 or CAP_PERFMON.\n", cr3);
+		}
 		if (errno == EINVAL && cr3 != 0) {
-			nyx_abort("perf PT: perf_event_open with attr.config2=0x%lx was "
+			nyx_abort("perf PT: perf_event_open with cr3_filter, cr3=0x%lx was "
 			          "refused with EINVAL. This kernel most likely lacks the "
 			          "IA32_RTIT_CR3_MATCH write path patch, so CR3 filtering "
 			          "is unavailable and there is no software fallback.\n", cr3);
@@ -901,15 +921,15 @@ static int perf_configure_cr3(CPUState *cpu, uint64_t cr3)
 	/* The filter string does not survive a reopen. */
 	perf_program_filters(cpu);
 
-	nyx_debug("perf PT: CR3 filter programmed via attr.config2=0x%lx\n", cr3);
+	nyx_debug("perf PT: CR3 filter programmed via cr3_filter, config1=0x%lx\n", cr3);
 	return 0;
 }
 
 static int perf_enable_cr3(CPUState *cpu)
 {
 	/*
-	Nothing to do: config2 was applied when the event was opened, and the
-	kernel sets RTIT_CTL.CR3EN whenever config2 is nonzero. The separate
+	Nothing to do: the cr3_filter bit and config1 were applied when the event
+	was opened, and the kernel programs the MSR on every start. The separate
 	configure and enable steps exist because the vmx_pt ioctl interface split
 	them.
 	*/
